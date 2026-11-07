@@ -1,0 +1,3 @@
+# Bí mật — KHÔNG commit (lặp lại ở cấp gốc cho chắc)
+.env
+*.keytab
