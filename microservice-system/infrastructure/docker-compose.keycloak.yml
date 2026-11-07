@@ -1,0 +1,69 @@
+# ==========================================================================
+#  Keycloak — dùng PostgreSQL làm database, truy cập được từ máy khác
+#
+#  Network `microservice-local` là external -> chạy docker-compose.postgres.yml
+#  TRƯỚC ít nhất một lần.
+#
+#  Chạy:  docker compose -f docker-compose.keycloak.yml up -d
+#  Admin console:  http://<IP-máy-chủ>:8180
+# ==========================================================================
+
+name: microservice-keycloak
+
+networks:
+  microservice-local:
+    external: true
+    name: microservice-local
+
+services:
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0.7
+    restart: unless-stopped
+    # `start` (không phải start-dev): bật persistence thật, tắt các mặc định
+    # chỉ hợp cho dev. HTTP bật vì đây là môi trường nội bộ chưa có TLS —
+    # xem mục "Trước khi dùng thật" trong README.
+    command:
+      - start
+      - --optimized=false
+      - --http-enabled=true
+      - --hostname-strict=false
+      - --proxy-headers=xforwarded
+    environment:
+      # --- Database ---------------------------------------------------
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/${KEYCLOAK_DB_NAME:-keycloak}
+      KC_DB_USERNAME: ${KEYCLOAK_DB_USER:?thiếu trong .env}
+      KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:?thiếu trong .env}
+
+      # --- Tài khoản admin đầu tiên (chỉ dùng lần khởi tạo) -----------
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:?thiếu trong .env}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?thiếu trong .env}
+
+      # --- Truy cập từ ngoài ------------------------------------------
+      # KC_HOSTNAME là URL mà NGƯỜI DÙNG gõ, không phải địa chỉ container.
+      # Keycloak nhúng giá trị này vào link trong admin console, vào
+      # issuer của token và vào redirect OIDC. Để trống + hostname-strict
+      # =false thì Keycloak suy ra từ header request — chạy được nhưng
+      # token sẽ có issuer khác nhau tuỳ client gõ localhost hay IP, làm
+      # hỏng việc xác thực token ở service khác. Đặt IP/tên miền thật.
+      KC_HOSTNAME: ${KEYCLOAK_HOSTNAME_URL:-}
+      KC_HTTP_ENABLED: "true"
+      KC_HEALTH_ENABLED: "true"
+      KC_METRICS_ENABLED: "true"
+      KC_LOG_LEVEL: ${KEYCLOAK_LOG_LEVEL:-INFO}
+      TZ: ${TZ:-Asia/Ho_Chi_Minh}
+    ports:
+      # Bind 0.0.0.0 -> gọi được từ máy khác trong LAN, không chỉ localhost.
+      # 8180 chứ không phải 8080 vì 8080 đã bị Kafka UI của stack khác chiếm.
+      - "${KEYCLOAK_BIND:-0.0.0.0}:${KEYCLOAK_PORT:-8180}:8080"
+    networks:
+      - microservice-local
+    healthcheck:
+      # Keycloak 26 phục vụ health trên cổng quản trị 9000, không phải 8080.
+      # Image không có curl/wget nên dùng /dev/tcp của bash.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q '\"status\": \"UP\"' <&3"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 90s

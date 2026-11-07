@@ -1,0 +1,48 @@
+# ==========================================================================
+#  PostgreSQL — database dùng chung cho microservice-system
+#
+#  File này TẠO network `microservice-local`; docker-compose.keycloak.yml
+#  tham chiếu nó qua `external: true`, nên phải chạy file này TRƯỚC.
+#
+#  Chạy:  docker compose -f docker-compose.postgres.yml up -d
+# ==========================================================================
+
+name: microservice-postgres
+
+networks:
+  microservice-local:
+    driver: bridge
+    name: microservice-local
+
+volumes:
+  postgres-data:
+
+services:
+
+  postgres:
+    image: postgres:16.6-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?thiếu trong .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?thiếu trong .env}
+      # Database mặc định; database cho Keycloak được tạo riêng bởi script bên dưới
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      # initdb chỉ chạy khi volume còn rỗng
+      KEYCLOAK_DB_NAME: ${KEYCLOAK_DB_NAME:-keycloak}
+      KEYCLOAK_DB_USER: ${KEYCLOAK_DB_USER:?thiếu trong .env}
+      KEYCLOAK_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:?thiếu trong .env}
+    ports:
+      # Bind 0.0.0.0 để truy cập được từ máy khác; đổi thành 127.0.0.1:5432
+      # trong .env nếu chỉ muốn mở nội bộ.
+      - "${POSTGRES_BIND:-0.0.0.0}:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    networks:
+      - microservice-local
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
