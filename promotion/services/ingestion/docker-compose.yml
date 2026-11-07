@@ -1,0 +1,54 @@
+# ==========================================================================
+#  promotion-ingestion (devtam2x/ingestion:latest) + xác thực Kafka Kerberos
+#
+#  Dùng chung:
+#    - network `promix-local`  do ../../infrastructure tạo
+#    - volume  `krb-share`     do ../../krb-experiment tạo (krb5.conf + keytab)
+#  Cả hai đều external -> hai stack kia phải chạy TRƯỚC.
+#
+#  Thứ tự:
+#    cd ../../infrastructure && docker compose up -d
+#    cd ../../krb-experiment && docker compose up -d --build
+#    cd .                    && docker compose up -d
+# ==========================================================================
+
+name: promotion-ingestion
+
+services:
+
+  ingestion:
+    image: ${INGESTION_IMAGE:-devtam2x/ingestion:latest}
+    container_name: promotion_ingestion
+    restart: unless-stopped
+    ports:
+      # 8080 trong container; host dùng 16070 vì 8080 đã bị Kafka UI Kerberos chiếm
+      - "${INGESTION_PORT:-16070}:8080"
+    environment:
+      # ADDITIONAL_LOCATION (không phải CONFIG_LOCATION) để giữ config gốc của image
+      SPRING_CONFIG_ADDITIONAL_LOCATION: "file:/config/application-local.properties"
+      JAVA_TOOL_OPTIONS: "-Djava.security.krb5.conf=/krb/krb5.conf"
+      TZ: ${TZ:-Asia/Ho_Chi_Minh}
+      # Bí mật: file .properties chỉ tham chiếu ${...}, giá trị thật nằm ở .env
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:?thiếu trong .env}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?thiếu trong .env}
+    volumes:
+      - ./config/application-local.properties:/config/application-local.properties:ro
+      - krb-share:/krb:ro
+    networks:
+      - promix-local
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8080/actuator/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
+networks:
+  promix-local:
+    external: true
+    name: promix-local
+
+volumes:
+  krb-share:
+    external: true
+    name: krb-share
