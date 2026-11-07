@@ -1,6 +1,7 @@
-# microservice-system / infrastructure
+# microservice-system / infrastructure / keycloak
 
 Hai stack tách riêng thành hai file compose, nối nhau qua network `microservice-local`.
+Network này do file postgres tạo và được `../elk` dùng lại.
 
 | File | Service | Cổng host |
 |---|---|---|

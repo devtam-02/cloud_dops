@@ -1,0 +1,3 @@
+http.host: "0.0.0.0"
+# Giám sát qua Elastic Agent/Metricbeat, không dùng cơ chế legacy đã bỏ
+xpack.monitoring.enabled: false

@@ -1,0 +1,147 @@
+# ==========================================================================
+#  ELK — Elasticsearch + Logstash + Kibana (8.15.2)
+#
+#  Network `microservice-local` khai external, giống stack keycloak.
+#  Nếu chạy ELK một mình (chưa chạy ../keycloak) thì tạo network trước:
+#      docker network create microservice-local
+#
+#  Chạy:  docker compose up -d
+#  Kibana: http://<IP-máy-chủ>:5601   (user `elastic`, mật khẩu trong .env)
+# ==========================================================================
+
+name: microservice-elk
+
+networks:
+  microservice-local:
+    external: true
+    name: microservice-local
+
+volumes:
+  elasticsearch-data:
+  kibana-data:
+
+services:
+
+  # -------------------------------------------------------- Elasticsearch
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${ELK_VERSION:-8.15.2}
+    restart: unless-stopped
+    environment:
+      node.name: elasticsearch
+      discovery.type: single-node
+      # Bảo mật BẬT: cổng 9200 bind ra LAN, tắt xác thực ở đây đồng nghĩa
+      # ai trong mạng cũng đọc/xoá được toàn bộ log.
+      xpack.security.enabled: "true"
+      xpack.security.enrollment.enabled: "false"
+      # TLS tắt vì đây là mạng nội bộ; xem "Trước khi dùng thật" trong README.
+      xpack.security.http.ssl.enabled: "false"
+      xpack.security.transport.ssl.enabled: "false"
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:?thiếu trong .env}
+      ES_JAVA_OPTS: ${ES_JAVA_OPTS:--Xms512m -Xmx512m}
+      bootstrap.memory_lock: "true"
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile:  { soft: 65536, hard: 65536 }
+    ports:
+      - "${ELASTIC_BIND:-0.0.0.0}:${ELASTIC_PORT:-9200}:9200"
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    networks:
+      - microservice-local
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -u elastic:${ELASTIC_PASSWORD} http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+
+  # ---------------------------------------------------------------- Setup
+  # Chạy một lần rồi thoát: đặt mật khẩu cho user hệ thống `kibana_system`.
+  # Kibana KHÔNG được dùng user `elastic` (superuser) để kết nối — Elastic
+  # chặn điều đó từ 8.x. Mật khẩu user này không thể đặt bằng biến môi
+  # trường như ELASTIC_PASSWORD, bắt buộc gọi API sau khi ES đã chạy.
+  es-setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${ELK_VERSION:-8.15.2}
+    restart: "no"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD}
+      KIBANA_SYSTEM_PASSWORD: ${KIBANA_SYSTEM_PASSWORD:?thiếu trong .env}
+    networks:
+      - microservice-local
+    command:
+      - bash
+      - -c
+      - |
+        set -euo pipefail
+        echo "[setup] đặt mật khẩu cho kibana_system ..."
+        until curl -fsS -u "elastic:$${ELASTIC_PASSWORD}" \
+              -X POST http://elasticsearch:9200/_security/user/kibana_system/_password \
+              -H 'Content-Type: application/json' \
+              -d "{\"password\":\"$${KIBANA_SYSTEM_PASSWORD}\"}" >/dev/null; do
+            echo "[setup] ES chưa sẵn sàng, thử lại sau 5s ..."; sleep 5
+        done
+        echo "[setup] xong."
+
+  # ---------------------------------------------------------------- Kibana
+  kibana:
+    image: docker.elastic.co/kibana/kibana:${ELK_VERSION:-8.15.2}
+    restart: unless-stopped
+    depends_on:
+      es-setup:
+        condition: service_completed_successfully
+    environment:
+      SERVER_NAME: kibana
+      # 0.0.0.0 để gọi được từ máy khác
+      SERVER_HOST: "0.0.0.0"
+      SERVER_PUBLICBASEURL: ${KIBANA_PUBLIC_URL:-}
+      ELASTICSEARCH_HOSTS: '["http://elasticsearch:9200"]'
+      ELASTICSEARCH_USERNAME: kibana_system
+      ELASTICSEARCH_PASSWORD: ${KIBANA_SYSTEM_PASSWORD}
+      # Thiếu các khoá này thì Kibana sinh khoá ngẫu nhiên mỗi lần khởi
+      # động, làm mất saved objects đã mã hoá (alert, connector...).
+      XPACK_SECURITY_ENCRYPTIONKEY: ${KIBANA_ENCRYPTION_KEY:?thiếu trong .env}
+      XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY: ${KIBANA_ENCRYPTION_KEY}
+      XPACK_REPORTING_ENCRYPTIONKEY: ${KIBANA_ENCRYPTION_KEY}
+      I18N_LOCALE: ${KIBANA_LOCALE:-en}
+    ports:
+      - "${KIBANA_BIND:-0.0.0.0}:${KIBANA_PORT:-5601}:5601"
+    volumes:
+      - kibana-data:/usr/share/kibana/data
+    networks:
+      - microservice-local
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:5601/api/status | grep -qE '\"level\":\"available\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 30
+      start_period: 90s
+
+  # -------------------------------------------------------------- Logstash
+  logstash:
+    image: docker.elastic.co/logstash/logstash:${ELK_VERSION:-8.15.2}
+    restart: unless-stopped
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      LS_JAVA_OPTS: ${LS_JAVA_OPTS:--Xms256m -Xmx256m}
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD}
+      ELASTIC_HOSTS: http://elasticsearch:9200
+    ports:
+      - "${LOGSTASH_BEATS_PORT:-5044}:5044"      # Filebeat/Elastic Agent
+      - "${LOGSTASH_TCP_PORT:-5000}:5000"        # TCP, mỗi dòng một JSON
+      - "${LOGSTASH_API_PORT:-9600}:9600"        # API giám sát của Logstash
+    volumes:
+      - ./logstash/config/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
+      - ./logstash/pipeline:/usr/share/logstash/pipeline:ro
+    networks:
+      - microservice-local
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9600/_node/stats >/dev/null"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
