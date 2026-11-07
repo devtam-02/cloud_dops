@@ -1,0 +1,192 @@
+# ==========================================================================
+#  Kafka (KRaft) + Kerberos (MIT KDC) + Kafka UI
+#  Stack ĐỘC LẬP, nhưng DÙNG CHUNG network `promix-local` với hạ tầng ở
+#  ../infrastructure, để services/* gọi được broker Kerberos.
+#
+#  Chạy:   docker compose up -d --build        (trong thư mục này)
+#  Yêu cầu: network `promix-local` phải TỒN TẠI trước (nó là external)
+#           -> chạy ../infrastructure trước ít nhất 1 lần.
+#
+#  LƯU Ý tên service là `krb-kafka`, KHÔNG phải `kafka`: stack promotion đã có
+#  một service tên `kafka`, nếu trùng thì trên cùng network sẽ có hai container
+#  cùng alias DNS `kafka` và Docker trả về luân phiên -> app lúc trúng broker
+#  PLAINTEXT, lúc trúng broker Kerberos. Alias `kafka.kafka.local` vẫn giữ
+#  nguyên nên SPN Kerberos và cấu hình client không phải đổi gì.
+#
+#  Container mang tiền tố `krb_` để phân biệt rõ với Kafka nội bộ của
+#  ../infrastructure (container `promotion-infra-kafka-1`).
+#
+#  Cần kèm: .env, kdc/Dockerfile, kdc/entrypoint.sh, kafka/wait-for-krb.sh
+#  Xem HUONG-DAN.md và KET-NOI-SERVICE.md để biết cách cấu hình client.
+# ==========================================================================
+
+name: kafka-kerberos
+
+x-krb-env: &krb-env
+  KRB5_REALM: ${KRB5_REALM}
+  KRB5_DOMAIN: ${KRB5_DOMAIN}
+  KDC_HOST: ${KDC_HOST}
+  KAFKA_HOST: ${KAFKA_HOST}
+
+services:
+
+  # ----------------------------------------------------------------------
+  # 1. KDC — MIT Kerberos (krb5kdc + kadmind)
+  # ----------------------------------------------------------------------
+  kdc:
+    build:
+      context: ./kdc
+    image: local/krb5-kdc:1.20
+    container_name: krb_kdc
+    hostname: ${KDC_HOST}
+    restart: unless-stopped
+    environment:
+      <<: *krb-env
+      KDC_MASTER_PASSWORD: ${KDC_MASTER_PASSWORD}
+      KDC_ADMIN_PASSWORD: ${KDC_ADMIN_PASSWORD}
+      CLIENT_PASSWORD: ${CLIENT_PASSWORD}
+    ports:
+      - "${KDC_PORT}:88/udp"      # Kerberos AS/TGS
+      - "${KDC_PORT}:88/tcp"
+      - "${KADMIN_PORT}:749/tcp"  # kadmin (quản trị principal từ xa)
+    volumes:
+      - krb-share:/krb           # keytab + krb5.conf dùng chung
+      - kdc-db:/var/lib/krb5kdc  # database KDC (bền giữa các lần restart)
+    networks:
+      promix-local:
+        aliases:
+          - ${KDC_HOST}
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /krb/.ready && kdestroy -A >/dev/null 2>&1; echo ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # ----------------------------------------------------------------------
+  # 2. Kafka broker — KRaft, listener ngoài dùng SASL_PLAINTEXT/GSSAPI
+  # ----------------------------------------------------------------------
+  krb-kafka:
+    image: confluentinc/cp-kafka:7.7.1
+    container_name: krb_kafka
+    hostname: ${KAFKA_HOST}
+    restart: unless-stopped
+    depends_on:
+      kdc:
+        condition: service_started
+    ports:
+      - "${KAFKA_EXTERNAL_PORT}:${KAFKA_EXTERNAL_PORT}"
+    entrypoint: ["/usr/local/bin/wait-for-krb.sh"]
+    command: ["/etc/confluent/docker/run"]
+    environment:
+      # --- KRaft -------------------------------------------------------
+      CLUSTER_ID: ${CLUSTER_ID}
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@krb-kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # --- Listeners ---------------------------------------------------
+      # CONTROLLER chỉ chạy nội bộ container nên để PLAINTEXT.
+      # BROKER là listener duy nhất cho client -> luôn yêu cầu Kerberos.
+      KAFKA_LISTENERS: BROKER://0.0.0.0:${KAFKA_EXTERNAL_PORT},CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: BROKER://${KAFKA_HOST}:${KAFKA_EXTERNAL_PORT}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: BROKER:SASL_PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: BROKER
+      # --- SASL / Kerberos ---------------------------------------------
+      KAFKA_SASL_ENABLED_MECHANISMS: GSSAPI
+      KAFKA_SASL_MECHANISM_INTER_BROKER_PROTOCOL: GSSAPI
+      KAFKA_SASL_KERBEROS_SERVICE_NAME: kafka
+      KAFKA_OPTS: >-
+        -Djava.security.auth.login.config=/krb/kafka_server_jaas.conf
+        -Djava.security.krb5.conf=/krb/krb5.conf
+        -Dsun.security.krb5.debug=false
+      # --- Authorization (ACL) -----------------------------------------
+      KAFKA_AUTHORIZER_CLASS_NAME: org.apache.kafka.metadata.authorizer.StandardAuthorizer
+      KAFKA_SUPER_USERS: User:kafka;User:admin;User:kafkaui;User:kafkaclient;User:ANONYMOUS
+      # true = ai đã xác thực Kerberos thì được dùng mọi topic chưa có ACL.
+      # Đổi thành false khi muốn siết quyền bằng ACL (xem HUONG-DAN.md).
+      KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND: "true"
+      # --- Cấu hình single-node ----------------------------------------
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - krb-share:/krb:ro
+      - kafka-data:/var/lib/kafka/data
+      - ./kafka/wait-for-krb.sh:/usr/local/bin/wait-for-krb.sh:ro
+    networks:
+      promix-local:
+        aliases:
+          - ${KAFKA_HOST}
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/127.0.0.1/${KAFKA_EXTERNAL_PORT}'"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 45s
+
+  # ----------------------------------------------------------------------
+  # 3. Kafka UI — kết nối broker bằng chính Kerberos
+  # ----------------------------------------------------------------------
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: krb_kafka_ui
+    restart: unless-stopped
+    depends_on:
+      krb-kafka:
+        condition: service_healthy
+    ports:
+      - "${KAFKA_UI_PORT}:8080"
+    environment:
+      DYNAMIC_CONFIG_ENABLED: "true"
+      JAVA_OPTS: "-Djava.security.krb5.conf=/krb/krb5.conf -Djavax.security.auth.useSubjectCredsOnly=false"
+      KAFKA_CLUSTERS_0_NAME: kerberos-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: ${KAFKA_HOST}:${KAFKA_EXTERNAL_PORT}
+      KAFKA_CLUSTERS_0_PROPERTIES_SECURITY_PROTOCOL: SASL_PLAINTEXT
+      KAFKA_CLUSTERS_0_PROPERTIES_SASL_MECHANISM: GSSAPI
+      KAFKA_CLUSTERS_0_PROPERTIES_SASL_KERBEROS_SERVICE_NAME: kafka
+      KAFKA_CLUSTERS_0_PROPERTIES_SASL_JAAS_CONFIG: 'com.sun.security.auth.module.Krb5LoginModule required useKeyTab=true storeKey=true refreshKrb5Config=true keyTab="/krb/kafkaui.keytab" principal="kafkaui@${KRB5_REALM}";'
+    volumes:
+      - krb-share:/krb:ro
+    networks:
+      promix-local:
+        aliases:
+          - kafka-ui.${KRB5_DOMAIN}
+
+  # ----------------------------------------------------------------------
+  # 4. Client CLI để test nhanh  (docker compose --profile tools up -d)
+  # ----------------------------------------------------------------------
+  kafka-client:
+    image: confluentinc/cp-kafka:7.7.1
+    container_name: krb_kafka_client
+    profiles: ["tools"]
+    depends_on:
+      krb-kafka:
+        condition: service_healthy
+    environment:
+      KRB5_CONFIG: /krb/krb5.conf   # cho kinit/klist của hệ điều hành
+      KAFKA_OPTS: "-Djava.security.krb5.conf=/krb/krb5.conf"
+    volumes:
+      - krb-share:/krb:ro
+    entrypoint: ["sleep", "infinity"]
+    networks:
+      promix-local:
+
+volumes:
+  # Tên tường minh để services/ingestion mount được qua `external: true`
+  krb-share:
+    name: krb-share
+  kdc-db:
+    name: krb-kdc-db
+  kafka-data:
+    name: krb-kafka-data
+
+networks:
+  # Network dùng chung, do ../infrastructure tạo ra với tên tường minh.
+  # Phải `docker compose up -d` bên infrastructure TRƯỚC.
+  promix-local:
+    external: true
+    name: promix-local
