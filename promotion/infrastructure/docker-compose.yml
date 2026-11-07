@@ -1,0 +1,211 @@
+# ==========================================================================
+#  Hạ tầng dùng chung cho promotion (local)
+#  Gộp từ promotion_env/docker-compose.mariadb.yml + docker-compose.redis.yml
+#
+#  Mọi thông tin nhạy cảm đọc từ .env (xem .env.example).
+#  Network `promix-local` được đặt TÊN TƯỜNG MINH để krb-experiment và
+#  services/* tham chiếu được qua `external: true` mà không phụ thuộc vào
+#  tên project của thư mục này.
+#
+#  KHÔNG đặt container_name: Docker tự sinh `promotion-infra-<service>-1`.
+#  Tên cố định sẽ chặn việc chạy song song hai stack trên cùng một máy và
+#  xung đột với container cũ còn sót của project khác.
+#
+#  Chạy:  docker compose up -d
+# ==========================================================================
+
+name: promotion-infra
+
+networks:
+  promix-local:
+    driver: bridge
+    name: promix-local
+
+volumes:
+  mariadb-data:
+  minio-data:
+  redis-data:
+  kafka-data:
+  mongodb-data:
+  elasticsearch-data:
+
+services:
+
+  # ---------------------------------------------------------------- MariaDB
+  mariadb:
+    image: mariadb:11.4
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:?thiếu trong .env}
+    ports:
+      - "${MARIADB_PORT:-3306}:3306"
+    volumes:
+      - mariadb-data:/var/lib/mysql
+    networks:
+      - promix-local
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # ------------------------------------------------------------------ Redis
+  redis:
+    image: redis:7.2-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?thiếu trong .env}"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - promix-local
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # ------------------------------------------------- Kafka nội bộ (PLAINTEXT)
+  # KHÔNG phải cụm Kerberos. Cụm Kerberos nằm ở ../krb-experiment.
+  kafka:
+    image: apache/kafka:4.2.1
+    restart: unless-stopped
+    ports:
+      - "${KAFKA_PORT:-9092}:9092"
+      - "${KAFKA_EXTERNAL_PORT:-19092}:19092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks:
+      - promix-local
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://0.0.0.0:19092,CONTROLLER://:9093
+      # EXTERNAL quảng bá theo KAFKA_ADVERTISED_HOST: để localhost nếu client ở
+      # cùng máy, đổi thành IP/hostname thật nếu client ở máy khác.
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://${KAFKA_ADVERTISED_HOST:-localhost}:${KAFKA_EXTERNAL_PORT:-19092}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID:-MkU3OEVBNTcwNTJENDM2Qk}
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:19092 --list >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ------------------------------------------------- UI cho Kafka nội bộ
+  kafbat:
+    image: ghcr.io/kafbat/kafka-ui:latest
+    restart: unless-stopped
+    ports:
+      - "${KAFBAT_PORT:-8989}:8080"
+    networks:
+      - promix-local
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      DYNAMIC_CONFIG_ENABLED: "true"
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_PROPERTIES_CLIENT_DNS_LOOKUP: use_all_dns_ips
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ---------------------------------------------------------------- MongoDB
+  mongodb:
+    image: mongo:7.0
+    restart: unless-stopped
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "${MONGODB_PORT:-27017}:27017"
+    volumes:
+      - mongodb-data:/data/db
+    networks:
+      - promix-local
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ ping: 1 }).ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  mongo-init:
+    image: mongo:7.0
+    restart: "no"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    networks:
+      - promix-local
+    command:
+      - bash
+      - -lc
+      - |
+        mongosh --host mongodb:27017 --quiet --eval '
+          try {
+            rs.status().ok
+          } catch (e) {
+            rs.initiate({_id: "rs0", members: [{_id: 0, host: "mongodb:27017"}]})
+          }
+        '
+
+  # ------------------------------------------------------------------ MinIO
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?thiếu trong .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?thiếu trong .env}
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    networks:
+      - promix-local
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  # ---------------------------------------------------------- Elasticsearch
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.2
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      xpack.security.enrollment.enabled: "false"
+      ES_JAVA_OPTS: ${ES_JAVA_OPTS:--Xms512m -Xmx512m}
+    ports:
+      - "${ELASTICSEARCH_PORT:-9200}:9200"
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    networks:
+      - promix-local
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200 >/dev/null"]
+      interval: 15s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
