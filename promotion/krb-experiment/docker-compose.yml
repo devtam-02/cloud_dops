@@ -76,7 +76,10 @@ services:
         condition: service_started
     ports:
       - "${KAFKA_EXTERNAL_PORT}:${KAFKA_EXTERNAL_PORT}"
-    entrypoint: ["/usr/local/bin/wait-for-krb.sh"]
+    # Gọi qua `bash <script>` thay vì chạy trực tiếp: script được bind-mount từ
+    # máy host, nên nếu host là NTFS/Windows (hoặc clone mất bit thực thi) thì
+    # chạy trực tiếp sẽ lỗi "permission denied". Qua bash thì bit đó vô can.
+    entrypoint: ["bash", "/usr/local/bin/wait-for-krb.sh"]
     command: ["/etc/confluent/docker/run"]
     environment:
       # --- KRaft -------------------------------------------------------
