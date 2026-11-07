@@ -69,51 +69,65 @@ EOF
 echo '*/admin@'"${REALM}"' *' > /etc/krb5kdc/kadm5.acl
 
 # ------------------------------------------------------------------
-# 2. Khởi tạo database (chỉ lần đầu)
+# 2. Khởi tạo database + ĐẢM BẢO principal/keytab (idempotent)
+#
+# Cố ý KHÔNG gộp vào nhánh "database chưa tồn tại". Nếu chỉ tạo principal
+# lúc khởi tạo lần đầu thì một volume kdc-db cũ (dựng bằng phiên bản
+# entrypoint trước, khi chưa có principal `ingestion`) sẽ khiến bước này bị
+# bỏ qua hoàn toàn: keytab không bao giờ được sinh ra, và client đọc nó sẽ
+# lỗi khó hiểu "Could not login: the client is being asked for a password"
+# — Krb5LoginModule không đọc được keytab nên rơi về hỏi mật khẩu.
+# Chạy mỗi lần khởi động, chỉ tạo thứ còn thiếu, nên nâng cấp là tự lành.
 # ------------------------------------------------------------------
 if [ ! -f "${DB_DIR}/principal" ]; then
     echo "[kdc] Creating KDC database for realm ${REALM} ..."
     kdb5_util create -r "${REALM}" -s -P "${MASTER_PW}"
-
-    add_princ() {  # $1 = principal, $2 = password (bỏ trống => random key)
-        if [ -n "${2:-}" ]; then
-            kadmin.local -q "addprinc -pw $2 $1" >/dev/null
-        else
-            kadmin.local -q "addprinc -randkey $1" >/dev/null
-        fi
-        echo "[kdc]   + $1"
-    }
-
-    # --- admin của KDC
-    add_princ "admin/admin@${REALM}" "${ADMIN_PW}"
-
-    # --- Service principal của broker (host PHẢI khớp advertised.listeners)
-    add_princ "kafka/${KAFKA_HOST}@${REALM}"
-
-    # --- Principal cho Kafka UI và cho client/CLI
-    add_princ "kafkaui@${REALM}"
-    add_princ "kafkaclient@${REALM}"
-
-    # --- Principal cho service promotion-ingestion
-    add_princ "ingestion@${REALM}"
-
-    # --- Principal người dùng, đăng nhập bằng mật khẩu (kinit alice)
-    add_princ "alice@${REALM}" "${CLIENT_PW}"
-    add_princ "bob@${REALM}"   "${CLIENT_PW}"
-
-    echo "[kdc] Exporting keytabs to ${SHARE_DIR} ..."
-    rm -f "${SHARE_DIR}"/*.keytab
-    kadmin.local -q "ktadd -k ${SHARE_DIR}/kafka.keytab       kafka/${KAFKA_HOST}@${REALM}" >/dev/null
-    kadmin.local -q "ktadd -k ${SHARE_DIR}/kafkaui.keytab     kafkaui@${REALM}"             >/dev/null
-    kadmin.local -q "ktadd -k ${SHARE_DIR}/kafkaclient.keytab kafkaclient@${REALM}"         >/dev/null
-    kadmin.local -q "ktadd -k ${SHARE_DIR}/ingestion.keytab   ingestion@${REALM}"             >/dev/null
-    kadmin.local -q "ktadd -k /etc/krb5kdc/kadm5.keytab kadmin/admin kadmin/changepw"       >/dev/null
-    chmod 644 "${SHARE_DIR}"/*.keytab
 else
-    echo "[kdc] Existing KDC database found, skipping bootstrap."
-    [ -f /etc/krb5kdc/kadm5.keytab ] || \
-        kadmin.local -q "ktadd -k /etc/krb5kdc/kadm5.keytab kadmin/admin kadmin/changepw" >/dev/null
+    echo "[kdc] Existing KDC database found; chỉ bổ sung thứ còn thiếu."
 fi
+
+princ_exists() {
+    kadmin.local -q "getprinc $1" 2>/dev/null | grep -q "^Principal: $1"
+}
+
+# $1 = principal, $2 = mật khẩu (bỏ trống => khoá ngẫu nhiên), $3 = keytab (tuỳ chọn)
+ensure_princ() {
+    local princ="$1" pw="${2:-}" keytab="${3:-}"
+    if princ_exists "$princ"; then
+        :
+    else
+        if [ -n "$pw" ]; then
+            kadmin.local -q "addprinc -pw $pw $princ" >/dev/null
+        else
+            kadmin.local -q "addprinc -randkey $princ" >/dev/null
+        fi
+        echo "[kdc]   + principal $princ"
+        # Principal vừa tạo mang khoá mới => keytab cũ (nếu có) đã vô giá trị.
+        [ -n "$keytab" ] && rm -f "$keytab"
+    fi
+
+    # Chỉ ktadd khi keytab thiếu: ktadd làm tăng kvno và vô hiệu hoá mọi bản
+    # keytab đã phát ra trước đó, nên không chạy lại một cách vô cớ.
+    if [ -n "$keytab" ] && [ ! -s "$keytab" ]; then
+        kadmin.local -q "ktadd -k $keytab $princ" >/dev/null
+        chmod 644 "$keytab"
+        echo "[kdc]   + keytab    $keytab"
+    fi
+}
+
+ensure_princ "admin/admin@${REALM}"            "${ADMIN_PW}"
+# Service principal của broker (host PHẢI khớp advertised.listeners)
+ensure_princ "kafka/${KAFKA_HOST}@${REALM}"    ""  "${SHARE_DIR}/kafka.keytab"
+ensure_princ "kafkaui@${REALM}"                ""  "${SHARE_DIR}/kafkaui.keytab"
+ensure_princ "kafkaclient@${REALM}"            ""  "${SHARE_DIR}/kafkaclient.keytab"
+# Service promotion-ingestion
+ensure_princ "ingestion@${REALM}"              ""  "${SHARE_DIR}/ingestion.keytab"
+# Người dùng đăng nhập bằng mật khẩu (kinit alice)
+ensure_princ "alice@${REALM}"                  "${CLIENT_PW}"
+ensure_princ "bob@${REALM}"                    "${CLIENT_PW}"
+
+[ -f /etc/krb5kdc/kadm5.keytab ] || \
+    kadmin.local -q "ktadd -k /etc/krb5kdc/kadm5.keytab kadmin/admin kadmin/changepw" >/dev/null
 
 # ------------------------------------------------------------------
 # 3. Phát krb5.conf + file JAAS ra volume dùng chung

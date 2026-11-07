@@ -43,15 +43,10 @@ ingestion.kafka.bi-data.security.key-tab=/krb/ingestion.keytab
 
 Không có keytab nào nằm trong repo, trong image, hay trong gói này.
 
-> **KDC đã chạy từ trước** (database cũ còn trong volume `kdc-db`) thì entrypoint bỏ qua bước
-> khởi tạo, nên principal mới không tự xuất hiện. Tạo tay một lần:
-> ```bash
-> docker compose -f ../../krb-experiment/docker-compose.yml exec kdc \
->   kadmin.local -q "addprinc -randkey ingestion@KAFKA.LOCAL"
-> docker compose -f ../../krb-experiment/docker-compose.yml exec kdc \
->   kadmin.local -q "ktadd -k /krb/ingestion.keytab ingestion@KAFKA.LOCAL"
-> docker compose -f ../../krb-experiment/docker-compose.yml exec kdc chmod 644 /krb/ingestion.keytab
-> ```
+> **KDC đã chạy từ trước?** Không cần làm gì. `kdc/entrypoint.sh` kiểm tra và bổ sung
+> principal/keytab còn thiếu ở **mỗi lần khởi động**, không chỉ lần khởi tạo đầu — nên
+> một volume `krb-kdc-db` cũ (dựng khi chưa có principal `ingestion`) sẽ tự lành sau
+> `docker compose up -d`. Keytab đã có thì không bị ghi đè, kvno giữ nguyên.
 
 ## Cấu hình
 
