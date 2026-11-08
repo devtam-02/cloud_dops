@@ -1,19 +1,4 @@
-# ==========================================================================
-#  Keycloak — dùng PostgreSQL làm database, truy cập được từ máy khác
-#
-#  Network `microservice-local` là external -> chạy docker-compose.postgres.yml
-#  TRƯỚC ít nhất một lần.
-#
-#  Chạy:  docker compose -f docker-compose.keycloak.yml up -d
-#  Admin console:  http://<IP-máy-chủ>:8180
-# ==========================================================================
-
 name: microservice-keycloak
-
-networks:
-  microservice-local:
-    external: true
-    name: microservice-local
 
 services:
 
@@ -25,10 +10,10 @@ services:
     # xem mục "Trước khi dùng thật" trong README.
     command:
       - start
-      - --optimized=false
-      - --http-enabled=true
-      - --hostname-strict=false
-      - --proxy-headers=xforwarded
+      # - --optimized=false
+      # - --http-enabled=true
+      # - --hostname-strict=false
+      # - --proxy-headers=xforwarded
     environment:
       # --- Database ---------------------------------------------------
       KC_DB: postgres
@@ -37,6 +22,8 @@ services:
       KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:?thiếu trong .env}
 
       # --- Tài khoản admin đầu tiên (chỉ dùng lần khởi tạo) -----------
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:?thiếu trong .env}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?thiếu trong .env}
       KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:?thiếu trong .env}
       KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?thiếu trong .env}
 
@@ -48,15 +35,22 @@ services:
       # token sẽ có issuer khác nhau tuỳ client gõ localhost hay IP, làm
       # hỏng việc xác thực token ở service khác. Đặt IP/tên miền thật.
       KC_HOSTNAME: ${KEYCLOAK_HOSTNAME_URL:-}
+      KC_HTTPS_CERTIFICATE_FILE: /opt/keycloak/conf/certs/cert.pem
+      KC_HTTPS_CERTIFICATE_KEY_FILE: /opt/keycloak/conf/certs/key.pem
+
       KC_HTTP_ENABLED: "true"
+      KC_PROXY:  edge
       KC_HEALTH_ENABLED: "true"
       KC_METRICS_ENABLED: "true"
       KC_LOG_LEVEL: ${KEYCLOAK_LOG_LEVEL:-INFO}
       TZ: ${TZ:-Asia/Ho_Chi_Minh}
+      
     ports:
-      # Bind 0.0.0.0 -> gọi được từ máy khác trong LAN, không chỉ localhost.
-      # 8180 chứ không phải 8080 vì 8080 đã bị Kafka UI của stack khác chiếm.
       - "${KEYCLOAK_BIND:-0.0.0.0}:${KEYCLOAK_PORT:-8180}:8080"
+      - "${KEYCLOAK_HTTPS_PORT:-8443}:8443"
+    volumes:
+      - ./certs:/opt/keycloak/conf/certs
+
     networks:
       - microservice-local
     healthcheck:
@@ -67,3 +61,8 @@ services:
       timeout: 10s
       retries: 20
       start_period: 90s
+
+networks:
+  microservice-local:
+    external: true
+    name: microservice-local
