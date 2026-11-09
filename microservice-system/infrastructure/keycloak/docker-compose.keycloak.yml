@@ -5,15 +5,17 @@ services:
   keycloak:
     image: quay.io/keycloak/keycloak:26.0.7
     restart: unless-stopped
-    # `start` (không phải start-dev): bật persistence thật, tắt các mặc định
-    # chỉ hợp cho dev. HTTP bật vì đây là môi trường nội bộ chưa có TLS —
-    # xem mục "Trước khi dùng thật" trong README.
+    # `start` (không phải start-dev): bật persistence thật.
+    # HTTPS do chính Keycloak phục vụ ở 8443 bằng cert trong ./certs;
+    # HTTP 8180 vẫn bật cho truy cập nội bộ và healthcheck.
     command:
       - start
-      # - --optimized=false
-      # - --http-enabled=true
-      # - --hostname-strict=false
-      # - --proxy-headers=xforwarded
+      - --http-enabled=true
+      - --https-port=8443
+      # hostname-strict=false: cho phép truy cập cả qua HTTP 8180 lẫn HTTPS
+      # 8443 mà không bị Keycloak từ chối vì host không khớp KC_HOSTNAME.
+      - --hostname-strict=false
+      - --proxy-headers=xforwarded
     environment:
       # --- Database ---------------------------------------------------
       KC_DB: postgres
@@ -22,8 +24,8 @@ services:
       KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:?thiếu trong .env}
 
       # --- Tài khoản admin đầu tiên (chỉ dùng lần khởi tạo) -----------
-      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:?thiếu trong .env}
-      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?thiếu trong .env}
+      # Bản 26 dùng KC_BOOTSTRAP_ADMIN_*; KEYCLOAK_ADMIN/_PASSWORD là tên cũ
+      # của bản <= 25, đặt thêm chỉ sinh cảnh báo deprecated nên đã bỏ.
       KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:?thiếu trong .env}
       KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?thiếu trong .env}
 
@@ -34,12 +36,20 @@ services:
       # =false thì Keycloak suy ra từ header request — chạy được nhưng
       # token sẽ có issuer khác nhau tuỳ client gõ localhost hay IP, làm
       # hỏng việc xác thực token ở service khác. Đặt IP/tên miền thật.
+      # Dùng HTTPS thì đặt KEYCLOAK_HOSTNAME_URL=https://<host>:8443 —
+      # để http://...:8180 ở đây thì issuer và mọi link vẫn là HTTP dù 8443
+      # đã mở, và client OIDC sẽ bị chuyển về HTTP.
       KC_HOSTNAME: ${KEYCLOAK_HOSTNAME_URL:-}
+      # Hai file này phải TỒN TẠI trong ./certs trước khi up, nếu không
+      # Keycloak bỏ qua HTTPS và 8443 không có ai nghe. Sinh bằng:
+      #     ./deploy-keycloak.sh
       KC_HTTPS_CERTIFICATE_FILE: /opt/keycloak/conf/certs/cert.pem
       KC_HTTPS_CERTIFICATE_KEY_FILE: /opt/keycloak/conf/certs/key.pem
 
       KC_HTTP_ENABLED: "true"
-      KC_PROXY:  edge
+      # KHÔNG dùng KC_PROXY: biến này bị bỏ từ bản 24 và xoá hẳn ở 26, lại
+      # mang nghĩa "TLS kết thúc ở proxy" -> Keycloak chỉ phục vụ HTTP và
+      # không bao giờ mở 8443. Thay bằng --proxy-headers ở phần command.
       KC_HEALTH_ENABLED: "true"
       KC_METRICS_ENABLED: "true"
       KC_LOG_LEVEL: ${KEYCLOAK_LOG_LEVEL:-INFO}
@@ -47,16 +57,27 @@ services:
       
     ports:
       - "${KEYCLOAK_BIND:-0.0.0.0}:${KEYCLOAK_PORT:-8180}:8080"
-      - "${KEYCLOAK_HTTPS_PORT:-8443}:8443"
+      - "${KEYCLOAK_BIND:-0.0.0.0}:${KEYCLOAK_HTTPS_PORT:-8443}:8443"
     volumes:
-      - ./certs:/opt/keycloak/conf/certs
+      - ./certs:/opt/keycloak/conf/certs:ro
 
     networks:
       - microservice-local
     healthcheck:
-      # Keycloak 26 phục vụ health trên cổng quản trị 9000, không phải 8080.
-      # Image không có curl/wget nên dùng /dev/tcp của bash.
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q '\"status\": \"UP\"' <&3"]
+      # KHÔNG dùng cổng quản trị 9000: khi HTTPS được bật, Keycloak chuyển
+      # luôn interface đó sang HTTPS, mà image không có curl/wget/openssl —
+      # chỉ có bash — nên không bắt tay TLS được. Hệ quả là healthcheck cũ
+      # kẹt mãi ở "health: starting" dù Keycloak chạy hoàn toàn bình thường.
+      #
+      # Thay bằng một request HTTP thật tới listener 8080 hỏi OIDC discovery
+      # của realm master: chỉ trả về issuer khi Keycloak đã nạp xong realm,
+      # nên đây là tín hiệu sẵn sàng thực sự chứ không chỉ là "cổng đã mở".
+      test:
+        - CMD-SHELL
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/8080 &&
+          printf 'GET /realms/master/.well-known/openid-configuration HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3 &&
+          grep -q '"issuer"' <&3
       interval: 15s
       timeout: 10s
       retries: 20
