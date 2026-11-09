@@ -1,3 +1,8 @@
 # Bí mật — KHÔNG commit (lặp lại ở cấp gốc cho chắc)
 .env
 *.keytab
+
+# Chung chi TLS tu sinh - KHONG BAO GIO commit private key
+certs/
+*.pem
+*.key
